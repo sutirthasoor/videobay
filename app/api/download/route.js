@@ -19,16 +19,16 @@ async function mobileSafe(file) {
     for (const x of j.streams) { if (x.codec_type === 'video') { v = x.codec_name; pf = x.pix_fmt; } if (x.codec_type === 'audio') a = x.codec_name; }
   } catch {}
   const ok = v === 'h264' && pf === 'yuv420p' && (!a || a === 'aac') && file.endsWith('.mp4');
-  await sh(process.env.FFMPEG || 'ffmpeg', ['-y', '-i', file, ...(ok ? ['-c', 'copy'] : ['-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k']), '-movflags', '+faststart', out]);
+  await sh(process.env.FFMPEG || 'ffmpeg', ['-y', '-i', file, ...(ok ? ['-c', 'copy'] : ['-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-threads', '1', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k']), '-movflags', '+faststart', out]);
   fs.unlink(file, () => {}); return out;
 }
 export async function GET(req) {
   const p = new URL(req.url).searchParams, url = p.get('url') || '';
-  const type = p.get('type') === 'mp3' ? 'mp3' : 'mp4', h = Math.min(parseInt(p.get('h')) || 720, 2160);
+  const type = p.get('type') === 'mp3' ? 'mp3' : 'mp4', h = Math.min(parseInt(p.get('h')) || 720, Number(process.env.MAX_HEIGHT || 720));
   const platform = platformOf(url);
   if (!platform) return new Response('Unsupported link', { status: 400 });
   if (limited(ipOf(req), 'd', 6)) return new Response('Too many requests', { status: 429 });
-  if (active >= Number(process.env.MAX_JOBS || 4)) return new Response('Server busy, retry shortly', { status: 503 });
+  if (active >= Number(process.env.MAX_JOBS || 1)) return new Response('Server busy, retry shortly', { status: 503 });
   active++;
   const tpl = path.join(os.tmpdir(), 'vb-' + crypto.randomUUID() + '.%(ext)s');
   const args = ['--no-playlist', '--no-warnings', '-q', '--no-simulate', '--max-filesize', '500M', '--print', 'after_move:filepath', '-o', tpl,

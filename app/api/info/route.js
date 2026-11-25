@@ -13,7 +13,7 @@ export async function POST(req) {
     if (d.availability && !['public', 'unlisted'].includes(d.availability)) return bad('This video is private or restricted and cannot be downloaded.');
     const vf = (d.formats || []).filter(f => f.vcodec && f.vcodec !== 'none' && f.height && !f.has_drm);
     if (!vf.length) return bad('This video is protected (DRM) or unavailable.');
-    const heights = [...new Set(vf.map(f => f.height))].filter(h => h >= 144).sort((a, b) => b - a).slice(0, 6);
+    const heights = [...new Set(vf.map(f => f.height))].filter(h => h >= 144 && h <= Number(process.env.MAX_HEIGHT || 720)).sort((a, b) => b - a).slice(0, 6);
     return Response.json({ platform, title: d.title || 'Video', thumbnail: d.thumbnail, duration: d.duration || 0, heights });
-  } catch (e) { return bad('Could not fetch this video. It may be private, removed, or region-locked.', 422); }
+  } catch (e) { console.error('yt-dlp:', e.message); return bad('Could not fetch this video. It may be private, removed, or region-locked.' + (process.env.DEBUG_ERRORS ? ' [' + e.message + ']' : ''), 422); }
 }
