@@ -1,50 +1,104 @@
-import fs from 'fs'; import os from 'os'; import path from 'path'; import { Readable } from 'stream';
-import { spawn } from 'child_process';
-import { run, platformOf } from '@/lib/ytdlp';
-import { limited, ipOf } from '@/lib/limit';
-import { db } from '@/lib/firebase';
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
-export const runtime = 'nodejs'; export const dynamic = 'force-dynamic';
+import { mkdtemp, readdir, stat, rm } from 'fs/promises';
+import { createReadStream } from 'fs';
+import { Readable } from 'stream';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { platformOf, cleanUrl, run, friendlyError } from '@/lib/ytdlp';
+import { makeCompatible } from '@/lib/compat';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+export const maxDuration = 300;
+
 let active = 0;
-const sh = (cmd, args, ms = 300000) => new Promise((res, rej) => {
-  const p = spawn(cmd, args); let o = ''; p.stdout.on('data', d => (o += d)); p.stderr.on('data', () => {});
-  const t = setTimeout(() => p.kill('SIGKILL'), ms);
-  p.on('error', rej); p.on('close', c => { clearTimeout(t); c === 0 ? res(o) : rej(new Error(cmd + ' failed')); });
-});
-// Make MP4 playable everywhere (WhatsApp, iPhone, Android): H.264 + AAC + yuv420p + faststart
-async function mobileSafe(file) {
-  const out = file.replace(/\.[^.]+$/, '') + '-ok.mp4'; let v = '', a = '', pf = '';
-  try {
-    const j = JSON.parse(await sh(process.env.FFPROBE || 'ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt', '-of', 'json', file], 30000));
-    for (const x of j.streams) { if (x.codec_type === 'video') { v = x.codec_name; pf = x.pix_fmt; } if (x.codec_type === 'audio') a = x.codec_name; }
-  } catch {}
-  const ok = v === 'h264' && pf === 'yuv420p' && (!a || a === 'aac') && file.endsWith('.mp4');
-  await sh(process.env.FFMPEG || 'ffmpeg', ['-y', '-i', file, ...(ok ? ['-c', 'copy'] : ['-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-threads', '1', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k']), '-movflags', '+faststart', out]);
-  fs.unlink(file, () => {}); return out;
+const MAX_ACTIVE = Number(process.env.MAX_DOWNLOADS || 3);
+
+// each list is tried in order until one succeeds -> maximises the chance every video downloads
+function selectors(q) {
+  if (q === 'audio') return ['ba/b'];
+  if (/^\d+$/.test(q)) {
+    const h = Number(q);
+    return [`bv*[height<=${h}]+ba/b[height<=${h}]`, 'bv*+ba/b', 'b', 'w'];
+  }
+  return ['bv*+ba/b', 'b', 'w'];
 }
+
+function safeName(t) {
+  const n = (t || 'video').replace(/[\\/:*?"<>|\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  return n || 'video';
+}
+
 export async function GET(req) {
-  const p = new URL(req.url).searchParams, url = p.get('url') || '';
-  const type = p.get('type') === 'mp3' ? 'mp3' : 'mp4', h = Math.min(parseInt(p.get('h')) || 720, Number(process.env.MAX_HEIGHT || 720));
-  const platform = platformOf(url);
-  if (!platform) return new Response('Unsupported link', { status: 400 });
-  if (limited(ipOf(req), 'd', 6)) return new Response('Too many requests', { status: 429 });
-  if (active >= Number(process.env.MAX_JOBS || 1)) return new Response('Server busy, retry shortly', { status: 503 });
+  const sp = new URL(req.url).searchParams;
+  const url = cleanUrl(sp.get('url') || '');
+  const q = sp.get('q') || 'best';
+  if (!platformOf(url)) return Response.json({ error: 'UNSUPPORTED_URL' }, { status: 400 });
+  if (active >= MAX_ACTIVE) return Response.json({ error: 'BUSY', message: 'Server is busy, retry in a few seconds.' }, { status: 429 });
+
   active++;
-  const tpl = path.join(os.tmpdir(), 'vb-' + crypto.randomUUID() + '.%(ext)s');
-  const args = ['--no-playlist', '--no-warnings', '-q', '--no-simulate', '--max-filesize', '500M', '--print', 'after_move:filepath', '-o', tpl,
-    ...(type === 'mp3' ? ['-x', '--audio-format', 'mp3', '--audio-quality', '0']
-      : ['-f', `bv*[height<=${h}]+ba/b[height<=${h}]/b`, '-S', 'vcodec:h264,acodec:aac', '--merge-output-format', 'mp4']), url];
-  let file;
-  try { file = (await run(args, 300000)).trim().split('\n').pop(); }
-  catch (e) { return new Response('Download failed: ' + e.message, { status: 502 }); }
-  finally { active--; }
-  if (file && type === 'mp4') { try { file = await mobileSafe(file); } catch (e) { return new Response('Could not prepare a compatible MP4: ' + e.message, { status: 502 }); } }
-  if (!file || !fs.existsSync(file)) return new Response('Download failed', { status: 502 });
-  addDoc(collection(db, 'downloads'), { platform, type, quality: type === 'mp3' ? 'mp3' : h + 'p', createdAt: serverTimestamp() }).catch(() => {});
-  const name = (p.get('title') || 'video').replace(/[^\w\- ]+/g, '').trim().slice(0, 80) || 'video';
-  const rs = fs.createReadStream(file); rs.on('close', () => fs.unlink(file, () => {}));
-  return new Response(Readable.toWeb(rs), { headers: {
-    'Content-Type': type === 'mp3' ? 'audio/mpeg' : 'video/mp4',
-    'Content-Length': String(fs.statSync(file).size),
-    'Content-Disposition': `attachment; filename="${name}.${type}"` } });
+  const dir = await mkdtemp(join(tmpdir(), 'vb-'));
+  const cleanup = () => rm(dir, { recursive: true, force: true }).catch(() => {});
+  const audio = q === 'audio';
+  let lastErr;
+
+  try {
+    for (const sel of selectors(q)) {
+      const args = [
+        '--no-playlist', '--playlist-items', '1', '--no-warnings', '--no-part',
+        '-f', sel,
+        '-o', join(dir, 'out.%(ext)s'),
+      ];
+      if (audio) args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+      else args.push('--merge-output-format', 'mp4', '-S', 'res,vcodec:h264,acodec:m4a');
+      if (process.env.YTDLP_MAX_FILESIZE) args.push('--max-filesize', process.env.YTDLP_MAX_FILESIZE);
+      args.push(url);
+      try {
+        await run(args, { ms: 280000, signal: req.signal });
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (req.signal?.aborted) break;
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await import('fs/promises').then(m => m.mkdir(dir, { recursive: true }));
+      }
+    }
+    if (lastErr) throw lastErr;
+
+    const files = (await readdir(dir)).filter(f => !/\.(part|ytdl|tmp)$/i.test(f));
+    if (!files.length) throw new Error('no output file');
+    let file = join(dir, files[0]);
+    let ext = files[0].split('.').pop().toLowerCase();
+
+    // make video playable/sendable on WhatsApp, iPhone, Android (H.264 + AAC-LC, faststart)
+    if (!audio && process.env.COMPAT !== '0') {
+      try {
+        file = await makeCompatible(file, join(dir, 'compat.mp4'));
+        ext = 'mp4';
+      } catch (e) {
+        console.error('[compat] skipped:', e.message); // serve original if ffmpeg fails
+      }
+    }
+    const size = (await stat(file)).size;
+
+    const name = `${safeName(sp.get('title'))}.${ext}`;
+    const ascii = name.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '');
+    const stream = createReadStream(file);
+    const done = () => { active--; cleanup(); };
+    stream.on('close', done);
+    stream.on('error', done);
+
+    return new Response(Readable.toWeb(stream), {
+      headers: {
+        'Content-Type': ext === 'mp3' ? 'audio/mpeg' : ext === 'webm' ? 'video/webm' : 'video/mp4',
+        'Content-Length': String(size),
+        'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+        'Cache-Control': 'no-store',
+      },
+    });
+  } catch (e) {
+    active--;
+    cleanup();
+    return Response.json({ error: 'DOWNLOAD_FAILED', message: friendlyError(e.message), detail: e.message }, { status: 422 });
+  }
 }
